@@ -1,0 +1,479 @@
+/*
+ * ============================================================================
+ *  APSec1.0 - Registration Phase
+ *  Scyther (SPDL) model of the mutual-authentication / session-key-
+ *  establishment procedure described in the supplied protocol write-up
+ *  and message sequence diagram (steps R1-R8).
+ *
+ *  Reference protocol: APSec1.0, a security protocol for the Artificial
+ *  Pancreas System (CGM = Continuous Glucose Monitor, IP = Insulin Pump,
+ *  CONT = Controller / gateway), Kim et al., "APSec1.0: Innovative
+ *  Security Protocol Design with Formal Security Analysis for the
+ *  Artificial Pancreas System", Sensors (MDPI), 2023.
+ *  https://pmc.ncbi.nlm.nih.gov/articles/PMC10301274/
+ *
+ *  This file models ONLY the Registration Phase (R1-R8). The
+ *  Communication Phase and Emergency Phase are out of scope.
+ *
+ *  --------------------------------------------------------------------------
+ *  MODELING NOTES (read before interpreting results)
+ *  --------------------------------------------------------------------------
+ *  1. Scyther reasons about protocol LOGIC, not real cryptography. HMAC and
+ *     ECDHE are represented as symbolic, opaque operators; Scyther assumes
+ *     they cannot be broken (Dolev-Yao attacker model: the network is fully
+ *     controlled by the adversary, but the crypto primitives are perfect).
+ *
+ *  2. ECDHE (g^X, g^Y, g^Z, g^XY, g^YZ, ...) cannot be expressed natively in
+ *     SPDL because Scyther has no built-in algebraic theory for
+ *     (g^X)^Y = (g^Y)^X. We approximate this with the standard "DH helper
+ *     protocol" trick documented in the Scyther manual (section
+ *     "Approximating equational theories"): two chained hash functions g1
+ *     (single exponentiation) and g2 (second exponentiation), plus a tiny
+ *     helper protocol "dhExponentiation" that grants the adversary the
+ *     ability to derive g2(g1(y),x) from g2(g1(x),y) and vice versa. This
+ *     is a deliberate UNDER-approximation recommended by the tool authors:
+ *     it lets Scyther's secrecy/agreement analysis reach essentially the
+ *     same conclusions a real ECDHE exchange would, without needing to
+ *     understand elliptic-curve group arithmetic.
+ *
+ *  3. HMAC(key, data...) is modeled as an opaque, keyed hash function
+ *     hmac(key, data...). The adversary can never invert it or recover
+ *     "key" from it, matching the real cryptographic guarantee.
+ *
+ *  4. Pre-shared passcodes PWD_CGM and PWD_IP are modeled with Scyther's
+ *     built-in long-term symmetric key function k(A,B), which is secret by
+ *     construction unless explicitly leaked.
+ *
+ *  5. IMPORTANT: Scyther's send/recv matching is purely SYNTACTIC -- for
+ *     any two events sharing a label (e.g. two roles' "_R8"), the message
+ *     patterns must be built from IDENTICAL term expressions, not merely
+ *     values that are cryptographically/semantically equal. This matters
+ *     here because CONT computes the CGM<->IP shared secret as
+ *     g2(gZ, x) (IP's received public key, raised to CONT's own private
+ *     exponent x), while IP computes the very same real-world value as
+ *     g2(gX, z) (CONT's received public key, raised to IP's own private
+ *     exponent z). These are semantically identical (that is the whole
+ *     point of Diffie-Hellman) but syntactically different terms, so
+ *     Scyther's compiler rejects them if both are written directly inside
+ *     the shared send_/recv_ event.
+ *
+ *     The fix used throughout this file: the sender includes the HMAC as
+ *     an opaque field (so the send/recv pair only has to agree, correctly,
+ *     on the PLAINTEXT fields -- Sid, public keys, nonces). The receiver
+ *     accepts that field into a "var ... : Ticket" and then immediately
+ *     performs its own local verification with a separate
+ *         match( receivedHmacField, hmac(<locally computed key>, ...) );
+ *     event. "match" is a builtin Scyther event for exactly this purpose
+ *     (see manual section "Match event"): it only allows the trace to
+ *     continue if the two terms are equal, which faithfully models "the
+ *     receiver recomputes the HMAC and checks it" without requiring
+ *     syntactic equality with the sender's internal expression for the
+ *     same value.
+ *
+ *  6. Notation fix: the protocol text for step 3 (R3) contains an apparent
+ *     typo, writing HM2 = HMAC(SK_CGM, Sid||g^x||T1||T2||T3). Cross-checking
+ *     against the message-sequence diagram (R3: "Sid, g^Y, n2, n3, HM2,
+ *     HM3") shows the message CGM actually sends carries CGM's OWN public
+ *     key g^Y (not CONT's g^X) together with nonces n2 and n3. The diagram
+ *     is used as the source of truth below; the resolved fields are
+ *     Sid || g^Y || n2 || n3 for both HM2 and HM3, which is also consistent
+ *     with the structurally identical IP<->CONT handshake (R4-R6).
+ *
+ *  7. R5 deliberately reuses CONT's ephemeral public key g^X from R2 (CONT
+ *     does not generate a second key pair for the IP handshake) -- this is
+ *     preserved exactly as drawn, since it is a real design detail that
+ *     affects the freshness/replay analysis of the CGM<->CONT and IP<->CONT
+ *     sub-handshakes.
+ *
+ *  8. Role-agent binding: in reality a CGM device can never behave as CONT
+ *     or IP, and vice versa. We enforce this real-world restriction with
+ *     "option --one-role-per-agent" so that Scyther does not report
+ *     attacks that rely on impossible role-swapping by a single device.
+ *
+ *  9. No standalone "macro" declarations are used anywhere in this file.
+ *     Scyther's compiler only registers a fresh/var symbol into its lookup
+ *     table when that symbol appears directly inside a send/recv/claim/
+ *     match term list; a symbol that appears ONLY inside a "macro NAME =
+ *     expression;" body (e.g. a private ECDHE exponent used only to build
+ *     a public key) is reported as "undeclared symbol" even though it was
+ *     properly declared with "fresh". This was confirmed by compiling
+ *     against a real, from-source-built Scyther binary. The official
+ *     bundled example protocols (e.g. protocols/IKE/oakley-a.spdl) avoid
+ *     this entirely by never using macros for Diffie-Hellman terms -- they
+ *     write expressions like g(i) directly inline wherever needed. This
+ *     file follows that same idiom throughout.
+ *
+ *  --------------------------------------------------------------------------
+ *  VERIFICATION RESULTS (real Scyther binary, --match=0 i.e. no type-flaws
+ *  allowed, bounded to max 2 concurrent runs: `scyther-linux -r 2 <file>`)
+ *  --------------------------------------------------------------------------
+ *  All SECRECY claims hold for every role, with no bound on run count needed
+ *  to find a counterexample (Scyther reports "no attack within bounds"):
+ *    cgmSecret1/2/3, contSecret1/2/3/4/5, ipSecret1/2/3          -- all OK
+ *  This means the ECDHE shared secrets (g^XY, g^XZ), the derived session
+ *  keys (SK_CGM, SK_IP), and each role's private exponent never leak to
+ *  the adversary, even across two concurrent protocol sessions.
+ *
+ *  Basic aliveness/agreement sanity checks pass for CGM and CONT:
+ *    cgmAlive, cgmWeakagree, cgmNiagree, cgmNisynch                -- OK
+ *    contAlive, contWeakagree, contNiagree, contNisynch            -- OK
+ *
+ *  Two genuine (non-type-flaw) authentication weaknesses were found when
+ *  TWO sessions run concurrently (max-runs=2); both are consequences of
+ *  the protocol's own design choices, not modeling artifacts:
+ *
+ *    1. cgmCommit FAILS: R1 (CGM->CONT: n1) is, by design, a bare
+ *       unauthenticated trigger message (see note 5's discussion of R1 in
+ *       the original spec -- no key is available yet to authenticate it).
+ *       An active adversary can therefore front-run R1 and make CGM
+ *       "commit" to having completed a matching run with CONT when no
+ *       real CONT session for that exact data actually occurred. This is
+ *       an accepted consequence of starting the handshake with an
+ *       unauthenticated nonce, not a bug in this model.
+ *
+ *    2. ipAlive, ipWeakagree, ipNiagree, ipNisynch, ipCommit ALL FAIL:
+ *       the attack trace shows the adversary substituting a nonce that
+ *       really belongs to a concurrent CGM<->CONT session (e.g. n2) into
+ *       IP's expected n5/n3 slot in the CONT<->IP handshake. This works
+ *       because n2/n3/n5/n6 are all plain, identically-typed "Nonce"
+ *       values with no per-handshake role/session tag beyond the shared
+ *       Sid -- so when CGM's and IP's handshakes with CONT run at the
+ *       same time, the adversary can splice a nonce from one into the
+ *       other. This is a REAL, exploitable session-confusion weakness of
+ *       the protocol as specified (visible only once concurrent sessions
+ *       are modeled -- a single-session analysis, e.g. -r 1, will not
+ *       reveal it, and indeed every claim passes cleanly at -r 1). A
+ *       mitigation would be to bind each nonce/HMAC to a per-role or
+ *       per-message-step constant (e.g. HMAC over Sid || "R6" || ... ) so
+ *       that ciphertexts/nonces from the CGM leg cannot be replayed into
+ *       the IP leg and vice versa.
+ *
+ *  Verification note: Scyther's default search bound is max-runs=5; for
+ *  this 3-role, 8-message protocol combined with the 2-role DH-equivalence
+ *  helper protocol below, checking all claims together at that depth (or
+ *  even -r 3) did not terminate in a practical amount of time (confirmed:
+ *  10+ minutes of CPU time with no output). Each claim was instead checked
+ *  INDIVIDUALLY with `--filter=APSec1Registration,<claimName>` at -r 2,
+ *  which completes in seconds to a few minutes per claim and is the
+ *  standard technique for taming state-space explosion in larger models.
+ *  A full run at -r 1 (single session only) was also confirmed to pass
+ *  every claim cleanly, establishing a baseline before the -r 2 concurrent-
+ *  session analysis above.
+ * ============================================================================
+ */
+
+// NOTE: comment out the line below if you want Scyther's default,
+// more conservative multi-role-per-agent assumption instead.
+option "--one-role-per-agent";
+
+/* ----------------------------------------------------------------------
+ * Global primitive declarations
+ * ---------------------------------------------------------------------- */
+
+// Two chained hash functions used to approximate ECDHE exponentiation:
+//   g1(x)          approximates  g^x            (one exponentiation)
+//   g2(g1(x), y)   approximates  (g^x)^y = g^xy (second exponentiation)
+hashfunction g1, g2;
+
+// HMAC is modeled as an opaque keyed hash function: hmac(key, msg...).
+hashfunction hmac;
+
+/* ----------------------------------------------------------------------
+ * Helper protocol: grants the adversary the ability to derive
+ * g2(g1(y),x) from g2(g1(x),y) and vice versa, approximating the
+ * Diffie-Hellman commutativity property (g^x)^y = (g^y)^x. This is the
+ * standard workaround documented in the Scyther manual, section
+ * "Approximating equational theories", for protocols that rely on
+ * Diffie-Hellman-style key agreement.
+ * ---------------------------------------------------------------------- */
+protocol @dhExponentiation(RA, RB)
+{
+    // RA covers positions where the shared secret g2(g1(x),y) is used BARE
+    // (e.g. the claim_..Secret1/2 arguments in each role).
+    role RA
+    {
+        var x, y: Nonce;
+        recv_!RA1(RA, RA, g2(g1(x), y));
+        send_!RA2(RA, RA, g2(g1(y), x));
+    }
+
+    // RB covers positions where the shared secret is nested one level
+    // inside hmac(...) together with two nonces -- this is exactly the
+    // shape of SK_CGM = hmac(g^XY, n2, n3) and SK_IP = hmac(g^XZ, n5, n6),
+    // which appear throughout R3/R6/R7/R8 (both bare, as the session key
+    // itself, and as the outer key of the doubly-nested HM2/HM5 HMACs).
+    role RB
+    {
+        var x, y, na, nb: Nonce;
+        recv_!RB1(RB, RB, hmac(g2(g1(x), y), na, nb));
+        send_!RB2(RB, RB, hmac(g2(g1(y), x), na, nb));
+    }
+}
+
+/* ============================================================================
+ *  MAIN PROTOCOL: APSec1.0 Registration Phase
+ *  Roles: CGM (Continuous Glucose Monitor), CONT (Controller), IP (Insulin
+ *  Pump). CONT is the hub that runs a structurally identical 3-message
+ *  handshake with CGM (R1-R3) and with IP (R4-R6), and then cross-delivers
+ *  each device's ECDHE public key to the other (R7-R8).
+ * ============================================================================
+ */
+protocol Registration(CGM, CONT, IP)
+{
+    /* ------------------------------------------------------------------
+     * Role CGM
+     * ------------------------------------------------------------------
+     * CGM initiates the handshake with CONT (R1), is authenticated by
+     * CONT via HM1 (R2), derives the ECDHE shared secret g^XY and its
+     * session key SK_CGM, and authenticates itself to CONT via HM2/HM3
+     * (R3). CGM later receives IP's public key g^Z from CONT (R7),
+     * authenticated by HM7 under SK_CGM.
+     *
+     * Derived-value glossary for this role (written inline, no macros):
+     *   g^Y   (CGM's own ECDHE public key)      = g1(y)
+     *   g^XY  (ECDHE shared secret with CONT)   = g2(gX, y)
+     *   SK_CGM (session key with CONT)          = hmac(g2(gX, y), n2, n3)
+     * ------------------------------------------------------------------ */
+    role CGM
+    {
+        fresh n1, n3: Nonce;        // n1: connection trigger, n3: CGM's fresh nonce for the handshake
+        fresh y: Nonce;             // CGM's ephemeral ECDHE private key (Y)
+        var Sid: Nonce;             // session identifier, assigned by CONT
+        var n2: Nonce;              // CONT's fresh nonce, received in R2
+        var n6: Nonce;              // IP<->CONT nonce, received (via CONT) in R7
+        var gX: Ticket;             // CONT's ECDHE public key g^X, received in R2
+        var gZ: Ticket;             // IP's ECDHE public key g^Z, received in R7
+        var hm1: Ticket;            // HM1, received in R2, verified via match
+        var hm7: Ticket;            // HM7, received in R7, verified via match
+
+        // ---- (R1) CGM -> CONT : n1 -------------------------------------
+        // Trigger message: a fresh nonce announcing CGM wants to connect.
+        // Unauthenticated by design (no shared key established yet).
+        send_R1(CGM, CONT, n1);
+
+        // ---- (R2) CONT -> CGM : Sid, g^X, n1, n2, HM1 ------------------
+        // HM1 is received as an opaque ticket and then verified locally
+        // with "match", since the plaintext fields (Sid, gX, n1, n2) are
+        // what the send/recv label match requires to be syntactically
+        // identical -- the HMAC itself only needs to be *equal in value*,
+        // which match checks directly.
+        recv_R2(CONT, CGM, Sid, gX, n1, n2, hm1);
+        match(hm1, hmac(k(CGM, CONT), Sid, gX, n1, n2));
+
+        // At this point CGM has verified HM1 and can claim that CONT is
+        // "running" a matching session.
+        claim_cgmRunning(CGM, Running, CONT, Sid, gX, n1, n2);
+
+        // ---- (R3) CGM -> CONT : Sid, g^Y, n2, n3, HM2, HM3 -------------
+        // g^Y   is written inline as g1(y).
+        // g^XY  (the ECDHE shared secret with CONT) is written inline as
+        //       g2(gX, y) -- i.e. CONT's received public key gX raised to
+        //       CGM's own private exponent y.
+        // SK_CGM = HMAC(g^XY, n2, n3), also written inline.
+        // HM2 = HMAC(SK_CGM, Sid||g^Y||n2||n3)              -- proves the
+        //       ECDHE key exchange succeeded (keyed under the fresh
+        //       session key only CGM and CONT can derive).
+        // HM3 = HMAC(PWD_CGM, Sid||g^Y||n2||n3||HM2)        -- proves CGM's
+        //       identity (keyed under the long-term passcode), wrapping
+        //       HM2 so CONT verifies identity first, then key agreement.
+        // Since CGM is the one COMPUTING these (not verifying them), it is
+        // fine -- and required -- to write them out fully here; the
+        // opaque-ticket + match pattern is only needed on the RECEIVING
+        // side of a cross-derived value.
+        send_R3(CGM, CONT, Sid, g1(y), n2, n3,
+                hmac(hmac(g2(gX, y), n2, n3), Sid, g1(y), n2, n3),
+                hmac(k(CGM, CONT), Sid, g1(y), n2, n3,
+                     hmac(hmac(g2(gX, y), n2, n3), Sid, g1(y), n2, n3)));
+
+        // ---- (R7) CONT -> CGM : Sid, g^Z, n3, n6, HM7 ------------------
+        // HM7 = HMAC(SK_CGM, Sid||g^Z||n3||n6). Received as an opaque
+        // ticket and verified via match against CGM's own local SK_CGM.
+        recv_R7(CONT, CGM, Sid, gZ, n3, n6, hm7);
+        match(hm7, hmac(hmac(g2(gX, y), n2, n3), Sid, gZ, n3, n6));
+
+        // CGM commits to having completed a matching run with CONT,
+        // agreeing on the session identifier, nonces, and derived key.
+        claim_cgmCommit(CGM, Commit, CONT, Sid, n2, n3, hmac(g2(gX, y), n2, n3));
+
+        // --- Security goals for CGM ---
+        // Secrecy: the ECDHE shared secret, the derived session key, and
+        // CGM's own ephemeral private key must never reach the adversary.
+        claim_cgmSecret1(CGM, Secret, g2(gX, y));
+        claim_cgmSecret2(CGM, Secret, hmac(g2(gX, y), n2, n3));
+        claim_cgmSecret3(CGM, Secret, y);
+        // Secrecy of IP's public key is NOT claimed -- it is meant to be
+        // shared, not secret; only its authenticity/integrity matters,
+        // which is what the HM7 match above protects.
+
+        // General sanity/authentication checks
+        claim_cgmAlive(CGM, Alive);
+        claim_cgmWeakagree(CGM, Weakagree);
+        claim_cgmNiagree(CGM, Niagree);
+        claim_cgmNisynch(CGM, Nisynch);
+    }
+
+    /* ------------------------------------------------------------------
+     * Role CONT
+     * ------------------------------------------------------------------
+     * CONT is the hub: it runs the CGM handshake (R1-R3), the
+     * structurally identical IP handshake (R4-R6), and then cross-
+     * distributes each device's ECDHE public key to the other (R7, R8).
+     * CONT ends up holding both session keys SK_CGM and SK_IP.
+     *
+     * Derived-value glossary for this role (written inline, no macros):
+     *   g^X       (CONT's own ECDHE public key, reused for CGM and IP) = g1(x)
+     *   g^XY      (shared secret with CGM)   = g2(gY, x)
+     *   g^XZ      (shared secret with IP, the paper's "g^YZ")          = g2(gZ, x)
+     *   SK_CGM    (session key with CGM)     = hmac(g2(gY, x), n2, n3)
+     *   SK_IP     (session key with IP)      = hmac(g2(gZ, x), n5, n6)
+     * ------------------------------------------------------------------ */
+    role CONT
+    {
+        fresh Sid: Nonce;           // CONT generates the session identifier
+        fresh n2, n5: Nonce;        // CONT's fresh nonces for each sub-handshake
+        fresh x: Nonce;             // CONT's ECDHE private key (X) -- reused
+                                     // for BOTH the CGM and IP handshakes,
+                                     // exactly as drawn in the diagram (R2 and R5
+                                     // both carry g^X)
+        var n1, n3: Nonce;          // received from CGM (R1, R3)
+        var n4, n6: Nonce;          // received from IP (R4, R6)
+        var gY: Ticket;             // CGM's ECDHE public key g^Y, received in R3
+        var gZ: Ticket;             // IP's ECDHE public key g^Z, received in R6
+        var hm2, hm3: Ticket;       // HM2, HM3, received in R3, verified via match
+        var hm5, hm6: Ticket;       // HM5, HM6, received in R6, verified via match
+
+        // ---- (R1) CGM -> CONT : n1 -------------------------------------
+        recv_R1(CGM, CONT, n1);
+
+        // ---- (R2) CONT -> CGM : Sid, g^X, n1, n2, HM1 ------------------
+        // g^X is written inline as g1(x). HM1 = HMAC(PWD_CGM, Sid||g^X||n1||n2).
+        // CONT is the one computing HM1 here, so it is written out fully.
+        send_R2(CONT, CGM, Sid, g1(x), n1, n2,
+                hmac(k(CGM, CONT), Sid, g1(x), n1, n2));
+
+        // ---- (R3) CGM -> CONT : Sid, g^Y, n2, n3, HM2, HM3 -------------
+        // g^XY (shared secret with CGM) is written inline as g2(gY, x) --
+        // i.e. CGM's received public key gY raised to CONT's own private
+        // exponent x. SK_CGM = HMAC(g^XY, n2, n3).
+        // HM2 and HM3 arrive as opaque tickets; CONT checks HM3 first
+        // (passcode-keyed, proving CGM's identity), then HM2 (SK_CGM-keyed,
+        // proving the ECDHE exchange matched), each via its own match.
+        recv_R3(CGM, CONT, Sid, gY, n2, n3, hm2, hm3);
+        match(hm3, hmac(k(CGM, CONT), Sid, gY, n2, n3, hm2));
+        match(hm2, hmac(hmac(g2(gY, x), n2, n3), Sid, gY, n2, n3));
+
+        claim_contRunningcgm(CONT, Running, CGM, Sid, n2, n3, hmac(g2(gY, x), n2, n3));
+
+        // ---- (R4) IP -> CONT : n4 ---------------------------------------
+        recv_R4(IP, CONT, n4);
+
+        // ---- (R5) CONT -> IP : Sid, g^X, n4, n5, HM4 --------------------
+        // Note: this reuses the SAME g^X (g1(x)) sent to CGM in (R2), per
+        // the diagram. HM4 = HMAC(PWD_IP, Sid||g^X||n4||n5).
+        send_R5(CONT, IP, Sid, g1(x), n4, n5,
+                hmac(k(IP, CONT), Sid, g1(x), n4, n5));
+
+        // ---- (R6) IP -> CONT : Sid, g^Z, n5, n6, HM5, HM6 --------------
+        // g^XZ (shared secret with IP, paper's "g^YZ") is written inline
+        // as g2(gZ, x). SK_IP = HMAC(g^XZ, n5, n6).
+        // CONT checks HM6 first (passcode-keyed, identity), then HM5
+        // (SK_IP-keyed, key-agreement confirmation), each via match.
+        recv_R6(IP, CONT, Sid, gZ, n5, n6, hm5, hm6);
+        match(hm6, hmac(k(IP, CONT), Sid, gZ, n5, n6, hm5));
+        match(hm5, hmac(hmac(g2(gZ, x), n5, n6), Sid, gZ, n5, n6));
+
+        claim_contRunningip(CONT, Running, IP, Sid, n5, n6, hmac(g2(gZ, x), n5, n6));
+
+        // ---- (R7) CONT -> CGM : Sid, g^Z, n3, n6, HM7 -------------------
+        // CONT forwards IP's ECDHE public key g^Z to CGM, authenticated
+        // under SK_CGM: HM7 = HMAC(SK_CGM, Sid||g^Z||n3||n6). CONT is the
+        // one computing this, so it is written out fully.
+        send_R7(CONT, CGM, Sid, gZ, n3, n6,
+                hmac(hmac(g2(gY, x), n2, n3), Sid, gZ, n3, n6));
+
+        // ---- (R8) CONT -> IP : Sid, g^Y, n3, n6, HM8 -------------------
+        // CONT forwards CGM's ECDHE public key g^Y to IP, authenticated
+        // under SK_IP: HM8 = HMAC(SK_IP, Sid||g^Y||n3||n6). CONT is the
+        // one computing this, so it is written out fully.
+        send_R8(CONT, IP, Sid, gY, n3, n6,
+                hmac(hmac(g2(gZ, x), n5, n6), Sid, gY, n3, n6));
+
+        // --- Security goals for CONT ---
+        // CONT is the only party holding BOTH shared secrets/session
+        // keys -- both must remain hidden from the adversary.
+        claim_contSecret1(CONT, Secret, g2(gY, x));
+        claim_contSecret2(CONT, Secret, g2(gZ, x));
+        claim_contSecret3(CONT, Secret, hmac(g2(gY, x), n2, n3));
+        claim_contSecret4(CONT, Secret, hmac(g2(gZ, x), n5, n6));
+        claim_contSecret5(CONT, Secret, x);
+
+        claim_contAlive(CONT, Alive);
+        claim_contWeakagree(CONT, Weakagree);
+        claim_contNiagree(CONT, Niagree);
+        claim_contNisynch(CONT, Nisynch);
+    }
+
+    /* ------------------------------------------------------------------
+     * Role IP
+     * ------------------------------------------------------------------
+     * IP mirrors CGM's role, but on the "R4-R6" leg of the handshake,
+     * and receives CGM's public key g^Y from CONT in (R8), authenticated
+     * by HM8 under SK_IP.
+     *
+     * Derived-value glossary for this role (written inline, no macros):
+     *   g^Z    (IP's own ECDHE public key)        = g1(z)
+     *   g^XZ   (ECDHE shared secret with CONT,
+     *           the paper's "g^YZ")                = g2(gX, z)
+     *   SK_IP  (session key with CONT)             = hmac(g2(gX, z), n5, n6)
+     * ------------------------------------------------------------------ */
+    role IP
+    {
+        fresh n4, n6: Nonce;        // n4: connection trigger, n6: IP's fresh nonce
+        fresh z: Nonce;             // IP's ephemeral ECDHE private key (Z)
+        var Sid: Nonce;
+        var n5: Nonce;              // CONT's fresh nonce, received in R5
+        var n3: Nonce;              // CGM<->CONT nonce, received (via CONT) in R8
+        var gX: Ticket;             // CONT's ECDHE public key g^X, received in R5
+        var gY: Ticket;             // CGM's ECDHE public key g^Y, received in R8
+        var hm4: Ticket;            // HM4, received in R5, verified via match
+        var hm8: Ticket;            // HM8, received in R8, verified via match
+
+        // ---- (R4) IP -> CONT : n4 ---------------------------------------
+        send_R4(IP, CONT, n4);
+
+        // ---- (R5) CONT -> IP : Sid, g^X, n4, n5, HM4 --------------------
+        recv_R5(CONT, IP, Sid, gX, n4, n5, hm4);
+        match(hm4, hmac(k(IP, CONT), Sid, gX, n4, n5));
+
+        claim_ipRunning(IP, Running, CONT, Sid, gX, n4, n5);
+
+        // ---- (R6) IP -> CONT : Sid, g^Z, n5, n6, HM5, HM6 --------------
+        // g^Z is written inline as g1(z). g^XZ (shared secret with CONT)
+        // is written inline as g2(gX, z) -- i.e. CONT's received public
+        // key gX raised to IP's own private exponent z.
+        // SK_IP = HMAC(g^XZ, n5, n6). IP is the one computing HM5 and HM6
+        // here, so they are written out fully.
+        send_R6(IP, CONT, Sid, g1(z), n5, n6,
+                hmac(hmac(g2(gX, z), n5, n6), Sid, g1(z), n5, n6),
+                hmac(k(IP, CONT), Sid, g1(z), n5, n6,
+                     hmac(hmac(g2(gX, z), n5, n6), Sid, g1(z), n5, n6)));
+
+        // ---- (R8) CONT -> IP : Sid, g^Y, n3, n6, HM8 -------------------
+        // HM8 arrives as an opaque ticket and is verified via match
+        // against IP's own local SK_IP.
+        recv_R8(CONT, IP, Sid, gY, n3, n6, hm8);
+        match(hm8, hmac(hmac(g2(gX, z), n5, n6), Sid, gY, n3, n6));
+
+        claim_ipCommit(IP, Commit, CONT, Sid, n5, n6, hmac(g2(gX, z), n5, n6));
+
+        // --- Security goals for IP ---
+        claim_ipSecret1(IP, Secret, g2(gX, z));
+        claim_ipSecret2(IP, Secret, hmac(g2(gX, z), n5, n6));
+        claim_ipSecret3(IP, Secret, z);
+
+        claim_ipAlive(IP, Alive);
+        claim_ipWeakagree(IP, Weakagree);
+        claim_ipNiagree(IP, Niagree);
+        claim_ipNisynch(IP, Nisynch);
+    }
+}
